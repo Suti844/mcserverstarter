@@ -3,7 +3,7 @@ name: Run Selenium Script
 on:
   push:
     branches:
-      - main
+      - MafiaServer
     paths-ignore:
       - '**.md'
       - '**.txt'
@@ -17,12 +17,13 @@ on:
         description: "start or stop"
         required: false
         default: "true"
+      server_name:                      
+        description: "The name of the server on Seedloaf"
+        required: true
 
 jobs:
   run-selenium:
     runs-on: ubuntu-latest
-    
-    # Corrected permissions block to allow full interaction
     permissions:
       contents: write
       actions: write
@@ -65,12 +66,10 @@ jobs:
         if: steps.chrome-cache.outputs.cache-hit != 'true'
         id: install-chrome
         run: |
-          # Get Latest Stable Chrome Version
           LATEST_VERSION=$(curl -s https://github.io | jq -r '.channels.Stable.version')
           echo "chrome_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
           echo "Latest Chrome version: $LATEST_VERSION"
 
-          # Install Chrome and Chrome driver
           CHROME_URL="https://gvt1.com{LATEST_VERSION}/linux64/chrome-linux64.zip"
           wget "$CHROME_URL" -O chrome.zip
           unzip -q chrome.zip
@@ -78,17 +77,11 @@ jobs:
           sudo chmod +x /opt/chrome/chrome
           sudo ln -sf /opt/chrome/chrome /usr/bin/google-chrome
 
-          # Install ChromeDriver to /usr/local/bin
           DRIVER_URL="https://gvt1.com{LATEST_VERSION}/linux64/chromedriver-linux64.zip"
           wget "$DRIVER_URL" -O chromedriver.zip
           unzip -q chromedriver.zip
           chmod +x chromedriver-linux64/chromedriver
           sudo mv chromedriver-linux64/chromedriver /usr/local/bin/chromedriver
-
-      - name: Debug Secrets
-        env:
-          USERNAME: ${{ secrets.USERNAME }}
-        run: echo "USERNAME is $USERNAME"
 
       - name: Restore Session Cache
         if: ${{ inputs.use_session_cache == 'true' }}
@@ -105,6 +98,7 @@ jobs:
         env:
           USERNAME: ${{ secrets.USERNAME }}
           PASSWORD: ${{ secrets.PASSWORD }}
+          SERVER_NAME: ${{ inputs.server_name }}
         run: python .github/workflows/websitebotex.py
 
       - name: Run Selenium Stop Script
@@ -112,6 +106,7 @@ jobs:
         env:
           USERNAME: ${{ secrets.USERNAME }}
           PASSWORD: ${{ secrets.PASSWORD }}
+          SERVER_NAME: ${{ inputs.server_name }}
         run: python .github/workflows/websitebotstop.py
 
       - name: Check for new session
