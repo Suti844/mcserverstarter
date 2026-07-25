@@ -1,128 +1,324 @@
-name: Run Selenium Script 
+import os
+import sys
+import discord
+import sqlite3
+import requests
+import threading
+import asyncio
+from flask import Flask
+from discord import app_commands
+from discord.ext import commands, tasks
+from datetime import datetime
 
-on:
-  push:
-    branches:
-      - MafiaServer
-    paths-ignore:
-      - '**.md'
-      - '**.txt'
-  workflow_dispatch:
-    inputs:
-      use_session_cache:
-        description: "Use session cache"
-        required: false
-        default: "false"
-      start_or_stop:
-        description: "start or stop"
-        required: false
-        default: "true"
-      server_name:                      
-        description: "The name of the server on Seedloaf"
-        required: true
+# === Flask Instance a Render Gunicorn Kapuhoz === #
+flask_app = Flask(__name__)
 
-jobs:
-  run-selenium:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      actions: write
+@flask_app.route('/')
+def health_check():
+    return "Bot interface is online and healthy!", 200
 
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
+# === SQLite Inicializálás === #
+db = sqlite3.connect("bot_data.db")
+cursor = db.cursor()
 
-      - name: Set Up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-          
-      - name: Cache pip dependencies
-        uses: actions/cache@v3
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('.github/workflows/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+cursor.execute('''CREATE TABLE IF NOT EXISTS server_settings (
+    server_id INTEGER PRIMARY KEY,
+    owner TEXT,
+    repo TEXT,
+    workflow_file TEXT,
+    github_token TEXT,
+    notify_channel INTEGER,
+    max_uses_per_day INTEGER,
+    cooldown_time INTEGER,
+    git_branch TEXT,
+    panel_server_name TEXT
+)''')
+
+cursor.execute('''CREATE TABLE IF NOT EXISTS user_usage (
+    server_id INTEGER,
+    user_id INTEGER,
+    uses INTEGER,
+    last_used REAL,
+    PRIMARY KEY (server_id, user_id)
+)''')
+db.commit()
+
+# === Bot Beállítások és Intent-ek === #
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+intents = discord.Intents.default()
+intents.message_content = True  # Szükséges a prefix parancsokhoz (!sync, !clearsync)
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# === Adatbázis Segédfunkciók === #
+def get_server_settings(server_id):
+    conn = sqlite3.connect("bot_data.db")
+    c = conn.cursor()
+    c.execute("SELECT * FROM server_settings WHERE server_id = ?", (server_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def update_server_settings(server_id, **kwargs):
+    conn = sqlite3.connect("bot_data.db")
+    c = conn.cursor()
+    current = get_server_settings(server_id)
+    
+    if current:
+        for key, value in kwargs.items():
+            if value is not None:  
+                c.execute(f"UPDATE server_settings SET {key} = ? WHERE server_id = ?", (value, server_id))
+    else:
+        c.execute("""
+            INSERT INTO server_settings (
+                server_id, owner, repo, workflow_file, github_token, notify_channel, 
+                max_uses_per_day, cooldown_time, git_branch, panel_server_name
+            ) VALUES (?, '', 'mcserverstarter', 'selenium.yml', '', 0, 3, 600, 'main', '')
+        """, (server_id,))
+        for key, value in kwargs.items():
+            if value is not None:
+                c.execute(f"UPDATE server_settings SET {key} = ? WHERE server_id = ?", (value, server_id))
+                
+    conn.commit()
+    conn.close()
+
+# === Jelenlét Frissítő Háttérfolyamat === #
+@tasks.loop(minutes=5)
+async def update_presence():
+    try:
+        activity = discord.Activity(type=discord.ActivityType.watching, name="MC Servers")
+        await bot.change_presence(activity=activity)
+        print("🎮 Bot status presence updated successfully.")
+    except Exception as e:
+        print(f"⚠️ Failed to update presence: {e}")
+
+# === Események (Events) === #
+@bot.event
+async def on_ready():
+    if not update_presence.is_running():
+        update_presence.start()
+    print(f"✅ Connected! Logged in as {bot.user}. Use !sync to deploy slash commands.")
+
+# === Slash Parancsok (Commands) === #
+@bot.tree.command(name="wssetup", description="Setup Github workflow and Minecraft server targets")
+@app_commands.describe(
+    owner="GitHub username", 
+    repo="GitHub repository (default=mcserverstarter)", 
+    workflow_file="GitHub workflow file (default=selenium.yml)", 
+    github_token="GitHub personal access token",
+    git_branch="Target Git Branch (e.g., MafiaServer)",
+    panel_server_name="Exact name of the server on the Seedloaf panel (e.g., Mafia)"
+)
+async def wssetup(
+    interaction: discord.Interaction, 
+    owner: str = None, 
+    repo: str = None, 
+    workflow_file: str = None, 
+    github_token: str = None,
+    git_branch: str = None,
+    panel_server_name: str = None
+):
+    sid = interaction.guild_id
+    if sid is None:
+        return await interaction.response.send_message("🚫 Use this in a server.", ephemeral=True)
+    
+    clean_owner = owner.strip().replace("/", "") if owner else ""
+    clean_repo = repo.strip().replace("/", "") if repo else ""
+    clean_file = workflow_file.strip().replace("/", "") if workflow_file else "selenium.yml"
+
+    update_server_settings(sid,
+        owner=clean_owner,
+        repo=clean_repo,
+        workflow_file=clean_file,
+        github_token=github_token.strip() if github_token else None,
+        git_branch=git_branch.strip() if git_branch else None,
+        panel_server_name=panel_server_name.strip() if panel_server_name else None
+    )
+    await interaction.response.send_message("✅ GitHub workflow and server panel settings updated cleanly.", ephemeral=True)
+
+@bot.tree.command(name="botsetup", description="Setup bot limits")
+@app_commands.describe(notify_channel="Notification channel", max_uses_per_day="Daily usage limit", cooldown_time="Cooldown in sec")
+async def botsetup(interaction: discord.Interaction, notify_channel: discord.TextChannel = None, max_uses_per_day: int = None, cooldown_time: int = None):
+    sid = interaction.guild_id
+    if sid is None:
+        return await interaction.response.send_message("🚫 Use this in a server.", ephemeral=True)
+    
+    update_server_settings(sid,
+        notify_channel=notify_channel.id if notify_channel else None,
+        max_uses_per_day=max_uses_per_day,
+        cooldown_time=cooldown_time
+    )
+    await interaction.response.send_message("✅ Bot settings updated.", ephemeral=True)
+
+@bot.tree.command(name="run_mc", description="Trigger a GitHub Actions workflow to start the configured MC server")
+@app_commands.describe(action="Choose whether to start or stop the world panel target")
+@app_commands.choices(action=[
+    app_commands.Choice(name="Start Server", value="true"),
+    app_commands.Choice(name="Stop Server", value="false")
+])
+async def run_mc(interaction: discord.Interaction, action: app_commands.Choice[str] = None):
+    sid = interaction.guild_id
+    uid = interaction.user.id
+    if sid is None:
+        return await interaction.response.send_message("🚫 Use this in a server.", ephemeral=True)
+
+    settings = get_server_settings(sid)
+    if not settings:
+        return await interaction.response.send_message("⚠️ Server settings not configured.", ephemeral=True)
+
+    _, owner, repo, workflow_file, token, notify_channel, max_uses, cooldown, git_branch, panel_server_name = settings
+
+    if not panel_server_name:
+        return await interaction.response.send_message("❌ Error: No panel server name configured for this Discord server.", ephemeral=True)
+
+    start_or_stop_val = action.value if action else "true"
+    action_label = "START" if start_or_stop_val == "true" else "STOP"
+
+    # Felhasználói limit ellenőrzése
+    conn = sqlite3.connect("bot_data.db")
+    c = conn.cursor()
+    c.execute("SELECT uses, last_used FROM user_usage WHERE server_id = ? AND user_id = ?", (sid, uid))
+    row = c.fetchone()
+    now = datetime.utcnow().timestamp()
+
+    if row:
+        uses, last_used = row
+        if uses >= max_uses:
+            conn.close()
+            return await interaction.response.send_message("🚫 Daily usage limit reached.", ephemeral=True)
+        if now - last_used < cooldown:
+            remaining = int(cooldown - (now - last_used))
+            conn.close()
+            return await interaction.response.send_message(f"⏳ Cooldown! Wait {remaining} sec.", ephemeral=True)
+    else:
+        uses, last_used = 0, 0
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        s_owner = str(owner).strip().replace("/", "")
+        s_repo = str(repo).strip().replace("/", "")
+        s_file = str(workflow_file).strip().replace("/", "")
+        
+        url = f"https://github.com{s_owner}/{s_repo}/actions/workflows/{s_file}/dispatches"
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
+        
+        data = {
+            "ref": str(git_branch).strip(),  
+            "inputs": {
+                "start_or_stop": start_or_stop_val,
+                "use_session_cache": "true",
+                "server_name": str(panel_server_name).strip()  
+            }
+        }
+
+        res = requests.post(url, json=data, headers=headers)
+        
+        if res.status_code == 204:
+            if row:
+                c.execute("UPDATE user_usage SET uses = ?, last_used = ? WHERE server_id = ? AND user_id = ?", (uses+1, now, sid, uid))
+            else:
+                c.execute("INSERT INTO user_usage (server_id, user_id, uses, last_used) VALUES (?, ?, ?, ?)", (sid, uid, 1, now))
+            conn.commit()
+            conn.close()
+
+            await interaction.followup.send(f"✅ Success! Workflow dispatch requested for **{action_label}**.", ephemeral=True)
             
-      - name: Install Dependencies
-        run: pip install -r .github/workflows/requirements.txt
+            if notify_channel and notify_channel != 0:
+                try:
+                    channel = bot.get_channel(notify_channel) or await bot.fetch_channel(notify_channel)
+                    if channel:
+                        await channel.send(f"🚀 {interaction.user.mention} requested a **{action_label}** event for the server.")
+                except Exception as channel_err:
+                    print(f"⚠️ Notification broadcast failed: {channel_err}")
+        else:
+            conn.close()
+            error_snippet = res.text[:150].replace('\n', ' ')
+            await interaction.followup.send(f"❌ Failed (Status Code {res.status_code}): `{error_snippet}...`", ephemeral=True)
 
-      - name: Install jq
-        run: sudo apt-get install -y jq unzip
+    except Exception as run_err:
+        print(f"❌ Critical runtime exception inside run_mc loop: {run_err}")
+        try: conn.close()
+        except: pass
+        await interaction.followup.send(f"❌ Critical Internal Error occurred: `{str(run_err)[:100]}`", ephemeral=True)
 
-      - name: Cache Chrome and ChromeDriver
-        id: chrome-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            /opt/chrome
-            /usr/local/bin/chromedriver
-          key: chrome-cache-v1
+@bot.tree.command(name="show_settings")
+async def show_settings(interaction: discord.Interaction):
+    sid = interaction.guild_id
+    settings = get_server_settings(sid)
+    if not settings:
+return await interaction.response.send_message("⚠️ Server not set up yet.", ephemeral=True)
 
-      - name: Check Chrome and Chrome driver
-        if: steps.chrome-cache.outputs.cache-hit != 'true'
-        id: install-chrome
-        run: |
-          LATEST_VERSION=$(curl -s https://github.io | jq -r '.channels.Stable.version')
-          echo "chrome_version=$LATEST_VERSION" >> $GITHUB_OUTPUT
-          echo "Latest Chrome version: $LATEST_VERSION"
+    _, owner, repo, workflow_file, token, notify_channel, max_uses, cooldown, git_branch, panel_server_name = settings
+    notify_channel_display = f"<#{notify_channel}>" if notify_channel else "`None`"
+    masked_token = f"{token[:4]}...{token[-4:]}" if len(token) > 8 else "Not Set"
+    
+    await interaction.response.send_message(
+        f"📋 **Current Server Settings**\n"
+        f" Owner: `{owner}`\n Repo: `{repo}`\n Workflow: `{workflow_file}`\n"
+        f" Git Branch Target: `{git_branch}`\n"
+        f" Panel Server Target Name: `{panel_server_name}`\n"
+        f" Token: `{masked_token}`\n"
+        f" Notify Channel: {notify_channel_display}\n"
+        f" Max Uses/Day: `{max_uses}`\n⏱ Cooldown: `{cooldown} sec`",
+        ephemeral=True
+    )
 
-          CHROME_URL="https://gvt1.com{LATEST_VERSION}/linux64/chrome-linux64.zip"
-          wget "$CHROME_URL" -O chrome.zip
-          unzip -q chrome.zip
-          sudo mv chrome-linux64 /opt/chrome
-          sudo chmod +x /opt/chrome/chrome
-          sudo ln -sf /opt/chrome/chrome /usr/bin/google-chrome
+@bot.tree.command(name="users_usage")
+async def users_usage(interaction: discord.Interaction):
+    sid = interaction.guild_id
+    conn = sqlite3.connect("bot_data.db")
+    c = conn.cursor()
+    c.execute("SELECT user_id, uses FROM user_usage WHERE server_id = ?", (sid,))
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        return await interaction.response.send_message("No usage data.", ephemeral=True)
+    result = "\n".join([f"<@{uid}>: {uses}" for uid, uses in rows])
+    await interaction.response.send_message(f"📊 Usage Stats:\n{result}", ephemeral=True)
 
-          DRIVER_URL="https://gvt1.com{LATEST_VERSION}/linux64/chromedriver-linux64.zip"
-          wget "$DRIVER_URL" -O chromedriver.zip
-          unzip -q chromedriver.zip
-          chmod +x chromedriver-linux64/chromedriver
-          sudo mv chromedriver-linux64/chromedriver /usr/local/bin/chromedriver
+@bot.tree.command(name="reset_usage")
+async def reset_usage(interaction: discord.Interaction):
+    sid = interaction.guild_id
+    conn = sqlite3.connect("bot_data.db")
+    c = conn.cursor()
+    c.execute("DELETE FROM user_usage WHERE server_id = ?", (sid,))
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message("🔄 Usage stats reset.", ephemeral=True)
 
-      - name: Restore Session Cache
-        if: ${{ inputs.use_session_cache == 'true' }}
-        id: restore-session
-        uses: actions/cache/restore@v4
-        with:
-          path: /tmp/seedloaf-session
-          key: seedloaf-session-cache-${{ github.run_id }}
-          restore-keys: |
-            seedloaf-session-cache-
+# === Szinkronizációs Prefix Parancsok === #
+@bot.command()
+@commands.is_owner()  
+async def sync(ctx):
+    progress_msg = await ctx.send("🔄 Contacting Discord API to sync application trees...")
+    try:
+        synced_commands = await bot.tree.sync()
+        await progress_msg.edit(content=f"✅ Success! **{len(synced_commands)}** application slash commands synchronized globally across all servers.")
+    except Exception as e:
+        await progress_msg.edit(content=f"❌ Sync failed with an API exception error: `{e}`")
 
-      - name: Run Selenium Start Script
-        if: ${{ inputs.start_or_stop == 'true' }}
-        env:
-          USERNAME: ${{ secrets.USERNAME }}
-          PASSWORD: ${{ secrets.PASSWORD }}
-          SERVER_NAME: ${{ inputs.server_name }}
-        run: python .github/workflows/websitebotex.py
+@bot.command()
+@commands.is_owner()  
+async def clearsync(ctx):
+    progress_msg = await ctx.send("🧹 Clearing old commands and running clean synchronization...")
+    try:
+        bot.tree.clear_commands(guild=None)
+        await bot.tree.sync()
+        synced_commands = await bot.tree.sync()
+        await progress_msg.edit(content=f"✨ Cleaned! **{len(synced_commands)}** commands remain.")
+    except Exception as e:
+        await progress_msg.edit(content=f"❌ Clear failed: `{e}`")
 
-      - name: Run Selenium Stop Script
-        if: ${{ inputs.start_or_stop == 'false' }}
-        env:
-          USERNAME: ${{ secrets.USERNAME }}
-          PASSWORD: ${{ secrets.PASSWORD }}
-          SERVER_NAME: ${{ inputs.server_name }}
-        run: python .github/workflows/websitebotstop.py
+# === Discord Bot Futtató Szál === #
+def run_discord_bot():
+    if not DISCORD_TOKEN:
+        print("❌ CRITICAL ERROR: The 'DISCORD_TOKEN' environment variable is missing!")
+    else:
+        bot.run(DISCORD_TOKEN.strip())
 
-      - name: Check for new session
-        if: ${{ inputs.use_session_cache == 'true' }}
-        id: session-check
-        run: |
-          if [ -f /tmp/seedloaf-session/.valid_session ]; then
-            echo "valid=true" >> $GITHUB_OUTPUT
-          else
-            echo "valid=false" >> $GITHUB_OUTPUT
-          fi
-      
-      - name: Save session cache
-        if: ${{ inputs.use_session_cache == 'true' && steps.session-check.outputs.valid == 'true' }}
-        uses: actions/cache/save@v4
-        continue-on-error: true
-        with:
-          path: /tmp/seedloaf-session
-          key: seedloaf-session-cache-${{ github.run_number }}
+threading.Thread(target=run_discord_bot, daemon=True).start()
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 10000))
+    flask_app.run(host="0.0.0.0", port=port)
